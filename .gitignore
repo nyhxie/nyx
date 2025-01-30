@@ -1,3 +1,7 @@
+# Project Specific
+nyx-beta.py
+config.yaml
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
