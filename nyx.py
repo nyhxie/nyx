@@ -2,13 +2,17 @@ import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, fields, field
 from datetime import datetime as dt
+import json
 import logging
 from typing import Literal, Optional
+import re
 
 import discord
 import httpx
 from openai import AsyncOpenAI
 import yaml
+
+from Memory.memory_handler import MemoryHandler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +34,13 @@ MAX_MESSAGE_NODES = 500
 
 CONTEXT_RETRIEVAL_LIMIT = 70
 
+NAME_PATTERNS = [
+    r"(?i)my name is\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)",
+    r"(?i)i(?:'|')?m called\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)",
+    r"(?i)call me\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)",
+    r"(?i)i go by\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)"
+]
+
 
 def get_config(filename="config.yaml"):
     with open(filename, "r") as file:
@@ -37,6 +48,12 @@ def get_config(filename="config.yaml"):
 
 
 cfg = get_config()
+memory_handler = MemoryHandler(
+    uri=cfg["neo4j"]["uri"],
+    username=cfg["neo4j"]["username"],
+    password=cfg["neo4j"]["password"],
+    bot_id=cfg["client_id"]  # Pass bot's ID
+)
 
 if client_id := cfg["client_id"]:
     logging.info(f"\n\nBOT INVITE URL:\nhttps://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=412317273088&scope=bot\n")
@@ -79,6 +96,17 @@ async def process_message():
         finally:
             message_queue.task_done()
 
+async def extract_and_update_name(content, user_id):
+    """Extract name from message and update user node if found"""
+    for pattern in NAME_PATTERNS:
+        if match := re.search(pattern, content):
+            name = match.group(1).strip()
+            # Validate name is reasonable (add more validation as needed)
+            if 2 <= len(name) <= 30 and all(part.isalpha() for part in name.split()):
+                memory_handler.update_user_known_name(user_id, name)
+                return name
+    return None
+
 async def handle_message(new_msg):
     global msg_nodes, last_task_time, context_retrieved, channel_contexts
 
@@ -106,16 +134,58 @@ async def handle_message(new_msg):
     context_messages_main = []
     context_messages_start = None
 
-    # Retrieve context if not already done for this channel and if it's a DM
-    if is_dm and new_msg.channel.id not in context_retrieved:
+    # TODO: Fix context retrieval message chain builder. Currently builds out of order and misses messages
+    # Initialize or rebuild conversation context
+    if new_msg.channel.id not in context_retrieved:
         context_retrieved.add(new_msg.channel.id)
-        context_messages_start = new_msg
-        context_messages = []
-        async for msg in new_msg.channel.history(limit=CONTEXT_RETRIEVAL_LIMIT, before=context_messages_start):
-            role = "user" if msg.author != discord_client.user else "assistant"
-            context_messages.append(dict(role=role, content=msg.content))
-            context_messages_main.append(dict(role=role, content=msg.content))
+        
+        # Rebuild conversation chain from memory
+        conversation_history = memory_handler.rebuild_conversation_chain(new_msg.author.id)
+        context_messages_main = [
+            {"content": msg["content"], "role": msg["role"]}
+            for msg in conversation_history
+        ]
         channel_contexts[new_msg.channel.id] = context_messages_main
+
+    # Store the user's message with Discord message ID
+    msg_data = memory_handler.store_user_message(
+        content=new_msg.content,
+        user_id=new_msg.author.id,
+        username=str(new_msg.author),
+        reply_to_id=new_msg.reference.message_id if new_msg.reference else None,
+        discord_msg_id=new_msg.id  # Add Discord message ID
+    )
+
+    if msg_data is None:
+        logging.error("Failed to store user message")
+        return
+
+    # Check for name declaration and update if found
+    if declared_name := await extract_and_update_name(new_msg.content, new_msg.author.id):
+        logging.info(f"Updated known name for user {new_msg.author.id} to {declared_name}")
+
+    # Add memory search function to API parameters
+    cfg["extra_api_parameters"]["functions"] = [
+        {
+            "name": "search_memories",
+            "description": "Search through conversation history and memories",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query to find relevant memories"
+                    },
+                    "min_similarity": {
+                        "type": "number",
+                        "description": "Minimum similarity threshold (0-1)",
+                        "default": 0.6
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    ]
 
     provider, model = cfg["model"].split("/", 1)
     base_url = cfg["providers"][provider]["base_url"]
@@ -211,7 +281,7 @@ async def handle_message(new_msg):
     # Prepend context messages to the beginning of the message chain
     messages = messages + channel_contexts.get(new_msg.channel.id, [])
 
-    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments: {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
+    logging.info(f"Message received (user ID: {new_msg.author.id}, attachments {len(new_msg.attachments)}, conversation length: {len(messages)}):\n{new_msg.content}")
 
     if system_prompt := cfg["system_prompt"]:
         system_prompt_extras = [f"Today's date: {dt.now().strftime('%B %d %Y')}."]
@@ -277,15 +347,24 @@ async def handle_message(new_msg):
 
             if use_plain_responses:
                 for content in response_contents:
+                    # Store bot's response with Discord message ID
                     if not is_dm:
                         reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
                         response_msg = await reply_to_msg.reply(content=content, suppress_embeds=True)
-                        response_msgs.append(response_msg)
                     else:
-                        reply_to_msg = new_msg if response_msgs == [] else response_msgs[-1]
                         response_msg = await new_msg.channel.send(content=content, suppress_embeds=True)
-                        response_msgs.append(response_msg)
 
+                    # Store the bot's response after sending
+                    try:
+                        memory_handler.store_bot_response(
+                            content=content,
+                            reply_to_msg_id=new_msg.id,
+                            discord_msg_id=response_msg.id
+                        )
+                    except Exception as e:
+                        logging.error(f"Failed to store bot response: {e}")
+                    
+                    response_msgs.append(response_msg)
                     msg_nodes[response_msg.id] = MsgNode(next_msg=new_msg)
                     await msg_nodes[response_msg.id].lock.acquire()
 
@@ -317,6 +396,10 @@ async def on_message(message):
 
     await message_queue.put(message)
 
+# Add cleanup on shutdown
+@discord_client.event
+async def on_shutdown():
+    memory_handler.close()
 
 async def main():
     await discord_client.login(cfg["bot_token"])

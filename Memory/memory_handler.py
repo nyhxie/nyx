@@ -229,3 +229,14 @@ class MemoryHandler:
                     u.name_updated_at = datetime()
                 RETURN u
             """, discord_id=discord_id, known_name=known_name)
+
+    async def get_last_interaction_time(self, channel_id):
+        """Get the timestamp of the last interaction in a channel"""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (m:Message)
+                WHERE m.channel_id = $channel_id
+                RETURN max(m.timestamp) as last_interaction
+            """, channel_id=str(channel_id))
+            record = result.single()
+            return record["last_interaction"] if record else None
