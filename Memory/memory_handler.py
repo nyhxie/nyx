@@ -94,22 +94,23 @@ class MemoryHandler:
         """Rebuild the conversation chain between user and bot"""
         with self.driver.session() as session:
             results = session.run("""
+                // Start with the user's messages and their replies
                 MATCH (u:User {discord_id: $user_id})-[:SENT]->(m:Message)
                 WITH m
-                MATCH path = (m)-[:REPLIES_TO*0..1]-(related:Message)
-                WHERE related.timestamp <= m.timestamp
-                WITH related
-                ORDER BY related.timestamp DESC
-                LIMIT $limit
-                WITH collect(related) as messages
-                UNWIND messages as msg
-                MATCH (sender:User)-[:SENT]->(msg)
-                RETURN msg.content as content,
-                       msg.timestamp as timestamp,
-                       msg.type as type,
+                OPTIONAL MATCH (m)<-[:REPLIES_TO]-(reply:Message)
+                WITH COLLECT(m) + COLLECT(reply) as all_messages
+                UNWIND all_messages as message
+                WITH DISTINCT message
+                WHERE message IS NOT NULL
+                // Get the sender of each message
+                MATCH (sender:User)-[:SENT]->(message)
+                RETURN message.content as content,
+                       message.timestamp as timestamp,
+                       message.type as type,
                        sender.discord_id as author_id,
                        sender.name as author_name
-                ORDER BY msg.timestamp ASC
+                ORDER BY message.timestamp DESC
+                LIMIT $limit
             """, user_id=user_id, limit=limit)
             
             return [{
