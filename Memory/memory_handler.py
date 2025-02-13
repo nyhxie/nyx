@@ -3,6 +3,7 @@ from neo4j import GraphDatabase
 import numpy as np
 from datetime import datetime
 import logging
+from .conversation_analyzer import ConversationSegment
 
 class MemoryHandler:
     def __init__(self, uri, username, password, bot_id):
@@ -15,6 +16,7 @@ class MemoryHandler:
             # Create constraints
             session.run("CREATE CONSTRAINT user_id IF NOT EXISTS FOR (u:User) REQUIRE u.discord_id IS UNIQUE")
             session.run("CREATE CONSTRAINT memory_id IF NOT EXISTS FOR (m:Message) REQUIRE m.id IS UNIQUE")
+            session.run("CREATE CONSTRAINT summary_id IF NOT EXISTS FOR (s:ConversationSummary) REQUIRE s.id IS UNIQUE")
             
             # Create bot user node
             session.run("""
@@ -90,7 +92,7 @@ class MemoryHandler:
             record = result.single()
             return record["msg_id"] if record else None
 
-    def rebuild_conversation_chain(self, user_id, limit=50):
+    def rebuild_conversation_chain(self, user_id, limit=128):
         """Rebuild the conversation chain between user and bot"""
         with self.driver.session() as session:
             results = session.run("""
@@ -240,3 +242,51 @@ class MemoryHandler:
             """, channel_id=str(channel_id))
             record = result.single()
             return record["last_interaction"] if record else None
+
+    def store_conversation_summary(self, user_id: int, segment: ConversationSegment):
+        """Store a conversation summary in the database"""
+        with self.driver.session() as session:
+            session.run("""
+                MATCH (u:User {discord_id: $user_id})
+                CREATE (s:ConversationSummary {
+                    id: randomUUID(),
+                    topic: $topic,
+                    summary: $summary,
+                    start_time: datetime($start_time),
+                    end_time: datetime($end_time)
+                })
+                CREATE (u)-[:HAD_CONVERSATION]->(s)
+                WITH s
+                UNWIND $message_ids as msg_id
+                MATCH (m:Message {discord_id: msg_id})
+                CREATE (m)-[:PART_OF]->(s)
+            """,
+                user_id=user_id,
+                topic=segment.topic,
+                summary=segment.summary,
+                start_time=segment.start_time.isoformat(),
+                end_time=segment.end_time.isoformat(),
+                message_ids=[msg.get("discord_id") for msg in segment.messages]
+            )
+
+    def get_relevant_summaries(self, query: str, limit: int = 3):
+        """Retrieve relevant conversation summaries based on semantic search"""
+        query_embedding = self._create_embedding(query)
+        
+        with self.driver.session() as session:
+            results = session.run("""
+                MATCH (s:ConversationSummary)
+                WITH s, gds.similarity.cosine($query_embedding, s.embedding) AS score
+                WHERE score >= 0.5
+                RETURN s.topic as topic,
+                       s.summary as summary,
+                       s.start_time as start_time,
+                       score
+                ORDER BY score DESC
+                LIMIT $limit
+            """,
+                query_embedding=query_embedding,
+                limit=limit
+            )
+            
+            return [dict(r) for r in results]
