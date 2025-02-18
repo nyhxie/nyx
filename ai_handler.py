@@ -4,78 +4,106 @@ import logging
 from typing import Any, Dict, List, Optional
 import httpx
 from Memory.memory_handler import MemoryHandler
+import pytz
 
 class AIHandler:
     def __init__(self, config: dict, memory_handler: MemoryHandler):
         self.config = config
         self.memory = memory_handler
-        self.client = httpx.AsyncClient(timeout=3000.0)
+        self.client = httpx.AsyncClient(timeout=30.0)
         
         # Cache for conversation contexts
         self.conversation_contexts = {}
-        self.context_retrieved = set()  # Track channels where context was retrieved
-        self.first_message_sent = set()  # Track channels where first message was sent
         
     async def get_response(self, user_id: int, message: str, conversation_id: str) -> str:
-        # Initialize or rebuild conversation context if needed
-        if conversation_id not in self.context_retrieved:
-            self.context_retrieved.add(conversation_id)
+        if conversation_id not in self.conversation_contexts:
             conversation_history = self.memory.rebuild_conversation_chain(user_id)
             self.conversation_contexts[conversation_id] = [
-                {"content": msg["content"], "role": msg["role"]}
-                for msg in reversed(conversation_history)
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in conversation_history
             ]
         
-        # Get conversation context
         context = self._get_context(conversation_id)
-        
-        # Build messages array
         messages = self._build_message_array(context, user_id, message)
-        
-        # Prepare API request
         api_url = f"{self.config['providers']['lmstudio']['base_url']}/chat/completions"
-        
-        # Only include tools if this isn't the first message in the channel
-        is_first_message = conversation_id not in self.first_message_sent
-        
-        while True:  # Handle multi-turn tool calls
-            try:
-                request_body = {
+
+        try:
+            # Initial request with tools enabled
+            response = await self.client.post(api_url, json={
+                "messages": messages,
+                "model": self.config["model"],
+                "tools": self._get_available_tools(),
+                "tool_choice": "auto",
+                **self.config["extra_api_parameters"]
+            })
+            response.raise_for_status()
+            initial_result = response.json()
+            assistant_message = initial_result["choices"][0]["message"]
+
+            # Check for tool calls
+            if tool_calls := assistant_message.get("tool_calls"):
+                # Store the tool call request message
+                tool_call_message = {
+                    "role": "assistant",
+                    "content": None,  # Set content to None since we're using tool_calls
+                    "tool_calls": [{
+                        "id": tool_call["id"],
+                        "type": tool_call["type"],
+                        "function": tool_call["function"]
+                    } for tool_call in tool_calls]
+                }
+                messages.append(tool_call_message)
+
+                # Execute tools and add results
+                for tool_call in tool_calls:
+                    tool_name = tool_call["function"]["name"]
+                    args = json.loads(tool_call["function"]["arguments"])
+
+                    # Execute tool
+                    if tool_name == "search_memories":
+                        result = self.memory.search_memories(**args)
+                    elif tool_name == "get_current_time":
+                        result = {
+                            "current_time": datetime.now().strftime("%I:%M %p"),
+                            "date": datetime.now().strftime("%B %d, %Y")
+                        }
+
+                    # Add tool result to messages
+                    messages.append({
+                        "role": "tool",
+                        "content": json.dumps(result),
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_name
+                    })
+
+                # Make final request with tool results AND tools enabled
+                final_response = await self.client.post(api_url, json={
                     "messages": messages,
                     "model": self.config["model"],
+                    "tools": self._get_available_tools(),  # Keep tools available
+                    "tool_choice": "auto",
                     **self.config["extra_api_parameters"]
-                }
+                })
+                final_result = final_response.json()
+                final_message = final_result["choices"][0]["message"]
                 
-                # Add tools only if not first message
-                if not is_first_message:
-                    request_body["tools"] = self._get_available_tools()
-                    request_body["tool_choice"] = "auto"
+                # If we got another tool call, process it recursively
+                if final_message.get("tool_calls"):
+                    messages.append(final_message)
+                    return await self.get_response(user_id, message, conversation_id)
                 
-                response = await self.client.post(api_url, json=request_body)
-                response.raise_for_status()
-                result = response.json()
-                
-                content = result["choices"][0]["message"]["content"]
-                
-                # After successful response, mark channel as having first message
-                if is_first_message:
-                    self.first_message_sent.add(conversation_id)
-                
-                # Update context
-                self._update_context(conversation_id, message, "user")
-                self._update_context(conversation_id, content, "assistant")
-                
-                # Handle potential tool calls only if not first message
-                if not is_first_message and (tool_calls := result["choices"][0]["message"].get("tool_calls")):
-                    tool_results = await self._handle_tool_calls(tool_calls)
-                    messages.extend(tool_results)
-                    continue
-                
-                return content
-                
-            except Exception as e:
-                logging.error(f"Error in AI response generation: {e}")
-                return "Sorry, I encountered an error while processing your message."
+                return final_message["content"]
+            else:
+                content = assistant_message["content"]
+
+            # Update context with final result
+            self._update_context(conversation_id, message, "user")
+            self._update_context(conversation_id, content, "assistant")
+            return content
+
+        except Exception as e:
+            logging.error(f"Error in AI response generation: {e}")
+            return "Sorry, I encountered an error while processing your message."
     
     def _get_context(self, conversation_id: str) -> List[Dict[str, str]]:
         if conversation_id not in self.conversation_contexts:
@@ -86,13 +114,14 @@ class AIHandler:
         context = self._get_context(conversation_id)
         context.append({"role": role, "content": content})
         
-        # Trim context if too long
-        if len(context) > 20:  # Adjust based on needs
+        # Keep a reasonable context window
+        if len(context) > 100:  # Increased from 20 to maintain more context
             context.pop(0)
             
     def _build_message_array(self, context: List[Dict[str, str]], user_id: int, message: str) -> List[Dict[str, str]]:
-        # Add current time to system prompt
-        current_time = f"\nCurrent time: {datetime.now().strftime('%B %d %Y %I:%M %p')}"
+        # Add current time to system prompt using EST
+        est = pytz.timezone('America/New_York')
+        current_time = f"\nCurrent time: {datetime.now(est).strftime('%B %d %Y %I:%M %p')}"
         
         messages = [
             {"role": "system", "content": self.config["system_prompt"] + current_time},
@@ -162,10 +191,7 @@ class AIHandler:
             # Execute tool and add result
             try:
                 if tool_name == "get_current_time":
-                    result = {
-                        "current_time": datetime.now().strftime("%I:%M %p"),
-                        "date": datetime.now().strftime("%B %d, %Y")
-                    }
+                    result = self._get_current_time()
                 elif tool_name == "search_memories":
                     result = self.memory.search_memories(**args)
                 else:
@@ -188,3 +214,12 @@ class AIHandler:
                 })
                 
         return results
+
+    def _get_current_time(self) -> Dict[str, str]:
+        # Get EST timezone
+        est = pytz.timezone('America/New_York')
+        current_time = datetime.now(est)
+        return {
+            "current_time": current_time.strftime("%I:%M %p"),
+            "date": current_time.strftime("%B %d, %Y")
+        }

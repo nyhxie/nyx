@@ -14,14 +14,16 @@ max_text: 100000
 max_images: 5
 max_messages: 500
 
-use_plain_responses: true
+use_plain_responses: # true/false
 
 # Database settings:
 
-neo4j_uri: 
-neo4j_user: 
-neo4j_password: 
+neo4j:
+  uri: ""
+  username: ""
+  password: ""
 
+max_context_age_days: 100
 
 # LLM settings:
 
@@ -44,18 +46,18 @@ providers:
   ollama:
     base_url: http://localhost:11434/v1
   lmstudio:
-    base_url: http://localhost:8888/v1
+    base_url: http://localhost:8888/api/v0
   vllm:
     base_url: http://localhost:8000/v1
   oobabooga:
     base_url: http://localhost:5000/v1
   jan:
-    base_url: http://localhost:1337/v1
+    base_url: http://localhost:6969/v1
 
-model: # provider/model-name
+model:    # [provider]/[model]
 
 extra_api_parameters:
-  max_tokens: 400
-  temperature: 0.9
+  max_tokens: 
+  temperature: 
 
 system_prompt: >

@@ -92,38 +92,53 @@ class MemoryHandler:
             record = result.single()
             return record["msg_id"] if record else None
 
-    def rebuild_conversation_chain(self, user_id, limit=128):
+    def rebuild_conversation_chain(self, user_id, limit=200):
         """Rebuild the conversation chain between user and bot"""
         with self.driver.session() as session:
             results = session.run("""
-                // Start with the user's messages and their replies
-                MATCH (u:User {discord_id: $user_id})-[:SENT]->(m:Message)
-                WITH m
-                OPTIONAL MATCH (m)<-[:REPLIES_TO]-(reply:Message)
-                WITH COLLECT(m) + COLLECT(reply) as all_messages
-                UNWIND all_messages as message
-                WITH DISTINCT message
-                WHERE message IS NOT NULL
-                // Get the sender of each message
+                // Find recent messages involving the user
+                MATCH (u:User {discord_id: $user_id})-[:SENT]->(start:Message)
+                WITH start
+                // Follow the reply chain in both directions up to 50 steps
+                CALL apoc.path.expandConfig(start, {
+                    relationshipFilter: 'REPLIES_TO|REPLIES_TO>',
+                    minLevel: 0,
+                    maxLevel: 50
+                })
+                YIELD path
+                WITH DISTINCT last(nodes(path)) as message
+                ORDER BY message.timestamp ASC
+                WITH collect(message) as messages
+                UNWIND messages as message
+                // Get the sender info
                 MATCH (sender:User)-[:SENT]->(message)
                 RETURN message.content as content,
                        message.timestamp as timestamp,
                        message.type as type,
+                       message.discord_id as msg_id,
                        sender.discord_id as author_id,
                        sender.name as author_name
-                ORDER BY message.timestamp DESC
+                ORDER BY message.timestamp ASC
                 LIMIT $limit
             """, user_id=user_id, limit=limit)
             
-            return [{
-                "content": r["content"],
-                "timestamp": r["timestamp"],
-                "role": "assistant" if r["type"] == "bot" else "user",
-                "author": {
-                    "id": r["author_id"],
-                    "name": r["author_name"]
-                }
-            } for r in results]
+            seen_msgs = set()
+            ordered_msgs = []
+            
+            for r in results:
+                if r["msg_id"] not in seen_msgs:
+                    seen_msgs.add(r["msg_id"])
+                    ordered_msgs.append({
+                        "content": r["content"],
+                        "timestamp": r["timestamp"],
+                        "role": "assistant" if r["type"] == "bot" else "user",
+                        "author": {
+                            "id": r["author_id"],
+                            "name": r["author_name"]
+                        }
+                    })
+            
+            return ordered_msgs
 
     def search_memories(self, query, min_similarity=0.6, limit=5):
         """Search through memories using semantic similarity"""
