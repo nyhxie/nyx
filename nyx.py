@@ -4,6 +4,8 @@ import discord
 from ai_handler import AIHandler
 from Memory.memory_handler import MemoryHandler
 import yaml
+import re
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO,
                    format="%(asctime)s %(levelname)s: %(message)s")
@@ -16,7 +18,8 @@ class NyxBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        super().__init__(intents=intents)
+        activity = discord.CustomActivity(name = get_config()["status_message"])
+        super().__init__(intents=intents, activity = activity)
         self.config = get_config()
         self.memory = MemoryHandler(
             uri=self.config["neo4j"]["uri"],
@@ -25,10 +28,27 @@ class NyxBot(discord.Client):
             bot_id=self.config["client_id"]
         )
         self.ai = AIHandler(self.config, self.memory)
+        
         self.message_queue = asyncio.Queue()
+        self.name_patterns = [
+            r"(?i)my name is\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)",
+            r"(?i)i(?:'|')?m called\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)",
+            r"(?i)call me\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)",
+            r"(?i)i go by\s+([A-Za-z]+(?:\s+[A-Za-z]+)?)"
+        ]
         
     async def setup_hook(self):
         self.loop.create_task(self._process_message_queue())
+        
+    async def on_ready(self):
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="you"
+            ),
+            status=discord.Status.online
+        )
+        logging.info(f"Logged in as {self.user} (ID: {self.user.id})")
         
     async def _process_message_queue(self):
         while True:
@@ -40,6 +60,16 @@ class NyxBot(discord.Client):
             finally:
                 self.message_queue.task_done()
                 
+    async def _extract_name(self, content: str) -> Optional[str]:
+        """Extract name from message if present"""
+        for pattern in self.name_patterns:
+            if match := re.search(pattern, content):
+                name = match.group(1).strip()
+                # Updated validation to allow alphanumeric characters
+                if 2 <= len(name) <= 32 and all(part.isalnum() for part in name.split()):
+                    return name
+        return None
+
     async def _handle_message(self, message: discord.Message):
         if not self._should_process_message(message):
             return
@@ -49,6 +79,14 @@ class NyxBot(discord.Client):
             cleaned_content = message.content
             if not isinstance(message.channel, discord.DMChannel):
                 cleaned_content = cleaned_content.replace(self.user.mention, "").strip()
+            
+            # Check for name declaration
+            if declared_name := await self._extract_name(cleaned_content):
+                try:
+                    self.memory.update_user_known_name(message.author.id, declared_name)
+                    logging.info(f"Updated known name for user {message.author.id} to {declared_name}")
+                except Exception as e:
+                    logging.error(f"Failed to update user name: {e}")
             
             # Get AI response
             response = await self.ai.get_response(
